@@ -1,0 +1,175 @@
+/*
+Carduino BatMon_v2 - An Arduino powered battery monitor for your car
+ Version 0.1, 012/08/2012
+ 
+ david@wyolum.com - http://forum.wyolum.com/forumdisplay.php?fid=13
+ 
+ BatMon monitors the voltage of your car battery (V_batt) while powering an external 12V load.   
+ If your car battery drops below a set threshold (V_cuttoff) the load will be switched off until 
+ the car battery rises above a set voltage, V_recovery.  BatMon can also be configured to automatically 
+ switch off power to the load after a period of time (Time_cuttoff) once the car has been switched off. 
+ 
+ Assume that the maximum voltage is 15V. At this maximum voltage we want to see no 
+ more than 4.0V on an analog arduino pin.  The voltage divider looks like this:
+ 
+ Vbatt +<--- R1 --- Analog_measurement --- R2 ---||| Ground
+ 
+ R1 + R2 = 150kOhms        to minimise current draw
+ R2 = (4V / 15V) * 150kOhms = 40kOhms
+ R1 = 110kOhms
+ 
+ Press and hold the mode button for three seconds at any time to re-enter mode selection mode.
+ Press the button the number of times corresponding to the mode you wish to select.
+ For example, to enter mode three, press the button three times.
+ After a short pause with no input the LED will flash the corresponding number of times
+ to confirm the mode and return to normal operation.
+ The selected mode is held in non-volitile memory and will remain the same until changed.
+ 
+ Set 1 : V_cuttoff = 12.2V
+ Set 2 : V_cuttoff = 12.1V
+ Set 3 : V_cuttoff = 12.0V
+ Set 4 : V_cuttoff = 11.9V
+ Set 5 : V_cuttoff = 11.8V
+ 
+ */
+
+#include "Time.h"
+
+#define NUMSAMPLES 7    // Number of samples to collect whilst measuring the average analogue voltage
+
+int readings[NUMSAMPLES];
+int readingindex =0;
+
+const int V_batt_pin = A0;         // V_battery is connected to analog pin 0
+const int Button_pin = A2;         // Button is connected to analog pin 2
+const int Relay_pin = A3;          // Relay output pin is connected to analog pin 3
+const int Cutoff_mode = 0;         // Default cutoff mode = 0
+
+float V_cutoff = 12.0;
+float V_engineON = 13.0;          // Voltage above which the engine is running, battery charging
+
+int cutoffState=0;
+long timeInState = 0;
+long beginningStateTime = 0;
+
+void setup()
+{
+  Serial.begin(9600);
+  pinMode(Button_pin, INPUT);
+  pinMode(Relay_pin, OUTPUT);
+  digitalWrite(Relay_pin, HIGH);     // turn the relay on during startup or reboot
+  startState(0); 
+
+  // Check the mode memory in eprom, set V_cuttoff to this value
+
+}
+
+float averagedRead()   // Return the average reading from the V_batt_pin.  Take NUMSAMPLES readings and average.
+{
+  int averageValue=0;
+  readings[readingindex] = analogRead(V_batt_pin);
+  readingindex=(readingindex+1)%NUMSAMPLES;
+  for (int i=0; i < NUMSAMPLES; i++){
+    averageValue=readings[i]+averageValue;
+  }
+  return(averageValue/NUMSAMPLES);
+}
+
+
+void loop()   
+{
+  float V_batt = averagedRead() * 0.0184; // 5.0 / 1024.0 * ((R1+R2) / R2);
+
+
+  //  V_cutoff = getCutoff();
+  processStateMachine(V_batt);
+
+
+}
+
+//LOWDELAY is the milliseconds required for voltage to be low
+// before cutoff (filtering transients)
+#define LOWDELAY 10000
+//HIGHDELAY is the milliseconds required for voltage to be OK
+// before turning back on (filtering transients)
+#define HIGHDELAY 3000
+
+/* States:
+ 0 = Relay ON and VBatt > 13v (Engine is running)
+ 1 = Relay ON and VBatt > Vcuttoff (Engine is off, but battery is ok)
+ 2 = Relay ON and VBatt < Vcuttoff, time less than LOWDELAY
+ 3 = Relay OFF and VBatt < Vcuttoff, low power mode
+ 4 = Relay OFF and VBatt > 13v, (Car started, but time less than HIGHDELAY)    
+ */
+
+void processStateMachine(float volts)
+{
+  long currentTime = now();
+  timeInState = currentTime-beginningStateTime;
+  switch (cutoffState){
+  case 0:    // Relay ON and VBatt > 13v (Engine is running)
+    if (volts <= V_engineON){
+      startState(1);
+      return;
+    }
+    else // volts > V_engineON   (The engine is running)
+    digitalWrite(Relay_pin, HIGH);  // turn the relay on
+    break;
+
+  case 1:   // Relay ON and VBatt > Vcuttoff (Engine is off, but battery is ok)
+    if (volts <= V_cutoff){  
+      startState(2);
+      return;
+    }
+    else if (volts > V_engineON){  // The engine is running
+      startState(0);
+      return;
+    }
+    break;
+
+  case 2: //Relay ON and VBatt < Vcuttoff, but time is less than LOWDELAY
+    if (volts <=V_cutoff){
+      if (timeInState >= LOWDELAY){ // time to shut off
+        startState(3);
+        digitalWrite(Relay_pin,LOW); // shut off output voltage
+        return;
+      }
+      else //waiting to confirm low voltage
+      return;
+    }
+    else //volts > V_cutoff
+    startState(1);
+    break;
+
+  case 3: // VBatt low and confirmed
+    if (volts > (V_engineON)){
+      // we may be ok again, but wait to see.
+      startState(4);
+    }
+    // otherwise stay off.
+    return;
+    break;
+
+  case 4: //Engine has been started, but waiting for HIGHDELAY
+    if (volts <= V_cutoff){// dipped low again
+      //go back to state 1
+      startState(3);
+      return;
+    }
+    else //check time in state
+    if (timeInState > HIGHDELAY){
+      startState(0);
+    }     
+    break;
+  }
+}
+
+void startState(int state){
+  Serial.print("Transitioning to state: ");
+  Serial.println(state);
+  cutoffState = state;
+  beginningStateTime = now();
+  timeInState =0;
+}
+
+
