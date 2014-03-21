@@ -34,155 +34,226 @@ Carduino BatMon_v2 - An Arduino powered battery monitor for your car
  
  */
 
-#include "Time.h"
+#include <Time.h>
+#include <TimerOne.h>
+#include "BatMon.h"
 
-#define NUMSAMPLES 7    // Number of samples to collect whilst measuring the average analogue voltage
+// Cutoff voltages depending on the mode
+const float v_cutoffs[6] = { 0, 12.2, 12.1, 12.0, 11.9, 11.8 };
 
 int readings[NUMSAMPLES];
-int readingindex =0;
+int readingindex = 0;
 
-const int V_batt_pin = A0;         // V_battery is connected to analog pin 0
-const int Button_pin = A2;         // Button is connected to analog pin 2
-const int Relay_pin = A3;          // Relay output pin is connected to analog pin 3
-const int Cutoff_mode = 0;         // Default cutoff mode = 0
+int cutoff_mode = CUTOFF_MODE_DEFAULT;
+float V_cutoff = v_cutoffs[CUTOFF_MODE_DEFAULT];
+float V_engineON = V_ENGINE_ON;    // Voltage above which the engine is running, battery charging
 
-float V_cutoff = 12.0;
-float V_engineON = 13.0;          // Voltage above which the engine is running, battery charging
+BatMonState currentState = UNINITIALISED;
+BatMonState newState = UNINITIALISED;
+int timeInNewState = 0;
 
-int cutoffState=0;
-long timeInState = 0;
-long beginningStateTime = 0;
+int globalTime = 0;
 
 void setup()
 {
   Serial.begin(9600);
-  pinMode(Button_pin, INPUT);
-  pinMode(Relay_pin, OUTPUT);
-  digitalWrite(Relay_pin, HIGH);     // turn the relay on during startup or reboot
-  startState(0); 
-
+  
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // turn the relay on during startup or reboot
+  
   // Check the mode memory in eprom, set V_cuttoff to this value
+  
+  FastFlash();
+  BlinkModeNumber(); 
+  
+  // TJS: fill up readings so there is something to average over
+  for(int i=0; i < N_SAMPLE; i++){
+    readings[i] = analogRead(V_BATT_PIN);
+  }
+  
+  // Setup the timer to execute the BatMon code at a frequency of LOOP_FREQ Hz
+  Timer1.initialize(1000000 / LOOP_FREQ);
+  Timer1.attachInterrupt(batMonLoop);
 }
 
-void BlinkModeNumber(int state){
-  Serial.print("Blink ");
-  Serial.println(state);
-  for (int i=0; i < state; i++){
-    digitalWrite(led, HIGH);   // turn the LED on (HIGH is the voltage level)
-    delay(500);               // wait for a second
-    digitalWrite(led, LOW);    // turn the LED off by making the voltage LOW
-    delay(500);               // wait for a second
+void loop()
+{
+  // Do whatever you want to in the loop()
+}
+
+void batMonLoop() {
+  float V_batt = averagedRead() * 0.0184; // 5.0 / 1024.0 * ((R1+R2) / R2);
+
+  globalTime++;
+
+  // Check the state of the button (assuming button pressed forces pin low?)
+  if(digitalRead(BUTTON_PIN) == LOW) {
+    getUserInput();
+  }
+
+  processStateMachine(V_batt);
+}
+
+// This function is called at LOOP_FREQ Hz
+void processStateMachine(float volts)
+{
+  BatMonState tempState = newState;
+  
+  newState = getcurrentState(volts);
+  
+  // Update if we are switching states
+  if(newState != currentState) {
+    
+    if(newState == tempState) {
+      timeInNewState++;
+    } else {
+      timeInNewState = 0;
+    }
+    // Whether we are switching state or not is determined in switchState()
+    switchState();
+    
+  } else {
+    timeInNewState = 0;
+  }
+  
+  // Display the state we are in on the LED
+  blinkState();
+}
+
+void getUserInput() {
+  while(1) {
+    // Get the beginning time
+    
+    // Wait for the button to be released
+    while(digitalRead(BUTTON_PIN) == LOW) { }
+    
+    // Check how long the button has been pressed for
   }
 }
 
-float averagedRead()   // Return the average reading from the V_batt_pin.  Take NUMSAMPLES readings and average.
+// Determines what BatMonState the car is currently in depending on the battery voltage
+BatMonState getcurrentState(float volts) {
+  if(volts > V_ENGINE_ON + HYSTERESIS) {
+    return ENGINE_RUNNING;
+  } else if(volts <= V_ENGINE_ON - HYSTERESIS && volts > v_cutoffs[cutoff_mode] + HYSTERESIS) {
+    return ENGINE_STOPPED;
+  } else if(volts <= v_cutoffs[cutoff_mode] - HYSTERESIS) {
+    return LOW_POWER_MODE;
+  } else {
+    // If none of the former states has been detected it is because we are in a 'gray zone'
+    // determine by HYSTERESIS. We don't switch states in these zones, which is why
+    // currentState is returned.
+    return currentState;
+  }
+}
+
+void switchState() {
+  // Based on newState and timeInNewState, determine if we are switching states
+  switch(newState) {
+    
+  case ENGINE_RUNNING:
+    if(timeInNewState >= HIGHDELAY) {
+      // The engine has been on for HIGHDELAY. We assume that it is running
+      currentState = newState;
+      Serial.println("Entered new state: engine running");
+    }
+    break;
+  
+  case ENGINE_STOPPED:
+    // We immediately switch to to engine stopped without delay
+    currentState = newState;
+    Serial.println("Entered new state: engine stopped");
+    break;
+    
+  case LOW_POWER_MODE:
+    if(timeInNewState >= LOWDELAY) {
+      // The voltage has been below low_power cutoff for LOWDELAY. We
+      // assume the battery is low.
+      currentState = newState;
+      Serial.println("Entered new state: low power mode");
+    }
+    break;
+    
+  default:
+    // Do nothing
+    break;
+  }
+}
+
+// Blinks depending on the state
+void blinkState() {
+  // Display the current mode on the LEDs
+  if(currentState == ENGINE_RUNNING || newState == ENGINE_RUNNING) {
+    digitalWrite(LED_GREEN, HIGH);  // turn on green LED
+    if(currentState != ENGINE_RUNNING) {
+      // We must be starting up! Make the LED amber
+      digitalWrite(LED_RED, HIGH);
+    } else {
+      digitalWrite(LED_RED, LOW);
+    }
+  } else {
+    int redLed, greenLed;
+    
+    if(currentState == ENGINE_STOPPED) {
+      greenLed = HIGH;
+    }
+    
+    if(newState == LOW_POWER_MODE || currentState == ENGINE_STOPPED) {
+      redLed = LOW;
+    }
+    
+    // This is a dity trick to make the LED blink at LOOP_FREQ / 32 Hz.
+    // The alternative would be to do divisions by 10 of globalTime
+    // which are costly on an AVR.
+    if((globalTime & 0x001F) < 0x0010) {
+      // For the first 16 loop()s the LED is on
+      digitalWrite(LED_GREEN, greenLed);
+      digitalWrite(LED_RED, redLed);
+    } else {
+      // For the next 16 loop()s the LED is off
+      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_RED, LOW);
+    }
+  }
+}
+
+void FastFlash() {
+  // Quickly blink the LEDs between red and green to show we
+  // are about to display the current mode
+  for(int i = 0; i < 10; i++) {
+    digitalWrite(LED_GREEN, HIGH);  // turn on green LED
+    digitalWrite(LED_RED, LOW);     // turn off red LED
+    delay(100);                     // LEDs flashing at 5Hz
+    
+    digitalWrite(LED_GREEN, LOW);   // and now the other way round
+    digitalWrite(LED_RED, HIGH);
+    delay(100);
+  }
+}
+
+void BlinkModeNumber() {
+  Serial.print("Blink ");
+  Serial.println(cutoff_mode);
+  
+  for (int i=0; i < cutoff_mode; i++){
+    digitalWrite(LED_GREEN, HIGH);  // turn on both LEDs for amber light
+    digitalWrite(LED_RED, HIGH);
+    delay(500);                     // wait for a second
+    
+    digitalWrite(LED_GREEN, LOW);   // turn off both LEDs
+    digitalWrite(LED_RED, LOW);
+    delay(500);                     // wait for a second
+  }
+}
+
+float averagedRead()   // Return the average reading from the V_BATT_PIN.  Take NUMSAMPLES readings and average.
 {
   int averageValue=0;
-  readings[readingindex] = analogRead(V_batt_pin);
+  readings[readingindex] = analogRead(V_BATT_PIN);
   readingindex = (readingindex + 1) % NUMSAMPLES;
   for (int i=0; i < NUMSAMPLES; i++){
     averageValue = readings[i] + averageValue;
   }
   return(averageValue / NUMSAMPLES);
 }
-
-
-void loop()   
-{
-  // TJS: fill up readings before you start averaging
-  for(int i=0; i < N_SAMPLE; i++){
-    readings[i] = analogRead(V_batt_pin);
-  }
-  float V_batt = averagedRead() * 0.0184; // 5.0 / 1024.0 * ((R1+R2) / R2);
-
-
-  //  V_cutoff = getCutoff();
-  processStateMachine(V_batt);
-}
-
-//LOWDELAY is the milliseconds required for voltage to be low
-// before cutoff (filtering transients)
-#define LOWDELAY 10000
-//HIGHDELAY is the milliseconds required for voltage to be OK
-// before turning back on (filtering transients)
-#define HIGHDELAY 3000
-
-/* States:
- 0 = Relay ON and VBatt > 13v (Engine is running)
- 1 = Relay ON and VBatt > Vcuttoff (Engine is off, but battery is ok)
- 2 = Relay ON and VBatt < Vcuttoff, time less than LOWDELAY
- 3 = Relay OFF and VBatt < Vcuttoff, low power mode
- 4 = Relay OFF and VBatt > 13v, (Car started, but time less than HIGHDELAY)    
- */
-
-void processStateMachine(float volts)
-{
-  long currentTime = now();
-  timeInState = currentTime-beginningStateTime;
-  switch (cutoffState){
-  case 0:    // Relay ON and VBatt > 13v (Engine is running)
-    if (volts <= V_engineON){
-      startState(1);
-      return;
-    }
-    else // volts > V_engineON   (The engine is running)
-    digitalWrite(Relay_pin, HIGH);  // turn the relay on
-    break;
-
-  case 1:   // Relay ON and VBatt > Vcuttoff (Engine is off, but battery is ok)
-    if (volts <= V_cutoff){  
-      startState(2);
-      return;
-    }
-    else if (volts > V_engineON){  // The engine is running
-      startState(0);
-      return;
-    }
-    break;
-
-  case 2: //Relay ON and VBatt < Vcuttoff, but time is less than LOWDELAY
-    if (volts <=V_cutoff){
-      if (timeInState >= LOWDELAY){ // time to shut off
-        startState(3);
-        digitalWrite(Relay_pin,LOW); // shut off output voltage
-        return;
-      }
-      else //waiting to confirm low voltage
-      return;
-    }
-    else //volts > V_cutoff
-    startState(1);
-    break;
-
-  case 3: // VBatt low and confirmed
-    if (volts > (V_engineON)){
-      // we may be ok again, but wait to see.
-      startState(4);
-    }
-    // otherwise stay off.
-    return;
-    break;
-
-  case 4: //Engine has been started, but waiting for HIGHDELAY
-    if (volts <= V_cutoff){// dipped low again
-      //go back to state 1
-      startState(3);
-      return;
-    }
-    else //check time in state
-    if (timeInState > HIGHDELAY){
-      startState(0);
-    }     
-    break;
-  }
-}
-
-void startState(int state){
-  Serial.print("Transitioning to state: ");
-  Serial.println(state);
-  cutoffState = state;
-  beginningStateTime = now();
-  timeInState =0;
-}
-
-

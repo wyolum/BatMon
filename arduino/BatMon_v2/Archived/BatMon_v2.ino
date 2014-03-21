@@ -1,6 +1,6 @@
 /*
 Carduino BatMon_v2 - An Arduino powered battery monitor for your car
- Version 0.1, 012/08/2012
+ Version 0.3, March 2014
  
  david@wyolum.com - http://forum.wyolum.com/forumdisplay.php?fid=13
  
@@ -25,6 +25,7 @@ Carduino BatMon_v2 - An Arduino powered battery monitor for your car
  to confirm the mode and return to normal operation.
  The selected mode is held in non-volitile memory and will remain the same until changed.
  
+ Set 0 : V_cuttoff is undefined, default to 12.2V = Set 1
  Set 1 : V_cuttoff = 12.2V
  Set 2 : V_cuttoff = 12.1V
  Set 3 : V_cuttoff = 12.0V
@@ -61,30 +62,42 @@ void setup()
   startState(0); 
 
   // Check the mode memory in eprom, set V_cuttoff to this value
+}
 
+void BlinkModeNumber(int state){
+  Serial.print("Blink ");
+  Serial.println(state);
+  for (int i=0; i < state; i++){
+    digitalWrite(led, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(500);               // wait for a second
+    digitalWrite(led, LOW);    // turn the LED off by making the voltage LOW
+    delay(500);               // wait for a second
+  }
 }
 
 float averagedRead()   // Return the average reading from the V_batt_pin.  Take NUMSAMPLES readings and average.
 {
   int averageValue=0;
   readings[readingindex] = analogRead(V_batt_pin);
-  readingindex=(readingindex+1)%NUMSAMPLES;
+  readingindex = (readingindex + 1) % NUMSAMPLES;
   for (int i=0; i < NUMSAMPLES; i++){
-    averageValue=readings[i]+averageValue;
+    averageValue = readings[i] + averageValue;
   }
-  return(averageValue/NUMSAMPLES);
+  return(averageValue / NUMSAMPLES);
 }
 
 
 void loop()   
 {
+  // TJS: fill up readings before you start averaging
+  for(int i=0; i < N_SAMPLE; i++){
+    readings[i] = analogRead(V_batt_pin);
+  }
   float V_batt = averagedRead() * 0.0184; // 5.0 / 1024.0 * ((R1+R2) / R2);
 
 
   //  V_cutoff = getCutoff();
   processStateMachine(V_batt);
-
-
 }
 
 //LOWDELAY is the milliseconds required for voltage to be low
